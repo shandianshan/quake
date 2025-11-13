@@ -9,6 +9,7 @@
 
 #include <common.h>
 #include <dynamic_inverted_list.h>
+#include <shared_mutex>
 
 class QuakeIndex;
 
@@ -31,6 +32,7 @@ public:
     bool check_uniques_ = false; ///< If true, check that vector IDs are unique and don't already exist in the index.
 
     std::set<int64_t> resident_ids_; ///< Set of partition IDs.
+    mutable std::shared_mutex partition_mutex_; ///< Guards access to partition metadata and storage.
 
     /**
      * @brief Constructor for PartitionManager.
@@ -186,6 +188,16 @@ public:
      * @param path Path to load the partition manager.
      */
     void load(const string &path);
+
+    /**
+     * @brief Acquire a shared (read) lock on the partitions.
+     */
+    std::shared_lock<std::shared_mutex> acquire_read_lock() const;
+
+    /**
+     * @brief Acquire an exclusive (write) lock on the partitions.
+     */
+    std::unique_lock<std::shared_mutex> acquire_write_lock() const;
 };
 
 

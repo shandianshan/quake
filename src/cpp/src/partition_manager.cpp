@@ -30,11 +30,20 @@ PartitionManager::~PartitionManager() {
     // no special cleanup
 }
 
+std::shared_lock<std::shared_mutex> PartitionManager::acquire_read_lock() const {
+    return std::shared_lock<std::shared_mutex>(partition_mutex_);
+}
+
+std::unique_lock<std::shared_mutex> PartitionManager::acquire_write_lock() const {
+    return std::unique_lock<std::shared_mutex>(partition_mutex_);
+}
+
 void PartitionManager::init_partitions(
     shared_ptr<QuakeIndex> parent,
     shared_ptr<Clustering> clustering,
     bool check_uniques
 ) {
+    auto write_lock = acquire_write_lock();
     if (debug_) {
         std::cout << "[PartitionManager] init_partitions: Entered." << std::endl;
     }
@@ -138,10 +147,6 @@ shared_ptr<ModifyTimingInfo> PartitionManager::add(
     /// Input validation
     //////////////////////////////////////////
     auto s1 = std::chrono::high_resolution_clock::now();
-    if (!partition_store_) {
-        throw runtime_error("[PartitionManager] add: partition_store_ is null. Did you call init_partitions?");
-    }
-
     if (!vectors.defined() || !vector_ids.defined()) {
         throw runtime_error("[PartitionManager] add: vectors or vector_ids is undefined.");
     }
@@ -171,22 +176,6 @@ shared_ptr<ModifyTimingInfo> PartitionManager::add(
         throw runtime_error("[PartitionManager] add: vector_ids must be unique.");
     }
 
-    if (check_uniques_ && check_uniques) {
-        // for each id insert into resident_ids_, if the id already exists, throw an error
-        auto id_ptr = vector_ids.data_ptr<int64_t>();
-        for (int64_t j = 0; j < n; j++) {
-            int64_t id_val = id_ptr[j];
-            if (resident_ids_.find(id_val) != resident_ids_.end()) {
-                throw runtime_error("[PartitionManager] init_partitions: vector ID already exists in the index.");
-            }
-            resident_ids_.insert(id_val);
-        }
-    }
-
-    // checks assignments are less than partition_store_->curr_list_id_
-    if (assignments.defined() && (assignments >= curr_partition_id_).any().item<bool>()) {
-        throw runtime_error("[PartitionManager] add: assignments must be less than partition_store_->curr_list_id_.");
-    }
     auto e1 = std::chrono::high_resolution_clock::now();
     timing_info->input_validation_time_us = std::chrono::duration_cast<std::chrono::microseconds>(e1 - s1).count();
 
@@ -234,13 +223,37 @@ shared_ptr<ModifyTimingInfo> PartitionManager::add(
     timing_info->find_partition_time_us = std::chrono::duration_cast<std::chrono::microseconds>(e2 - s2).count();
 
     //////////////////////////////////////////
-    /// Add vectors to partitions
+    /// Add vectors to partitions (exclusive section)
     //////////////////////////////////////////
     auto s3 = std::chrono::high_resolution_clock::now();
-    size_t code_size_bytes = partition_store_->code_size;
+    auto write_lock = acquire_write_lock();
+    if (!partition_store_) {
+        throw runtime_error("[PartitionManager] add: partition_store_ is null. Did you call init_partitions?");
+    }
+
+    // ensure assignments are in range
+    for (int64_t pid : partition_ids_for_each) {
+        if (pid >= curr_partition_id_ || pid < 0) {
+            throw runtime_error("[PartitionManager] add: partition assignment out of range.");
+        }
+    }
+
     auto id_ptr = vector_ids.data_ptr<int64_t>();
     auto id_accessor = vector_ids.accessor<int64_t, 1>();
     const uint8_t *code_ptr = as_uint8_ptr(vectors);
+    size_t code_size_bytes = partition_store_->code_size;
+
+    if (check_uniques_ && check_uniques) {
+        for (int64_t j = 0; j < n; j++) {
+            int64_t id_val = id_ptr[j];
+            if (resident_ids_.find(id_val) != resident_ids_.end()) {
+                throw runtime_error("[PartitionManager] init_partitions: vector ID already exists in the index.");
+            }
+        }
+        for (int64_t j = 0; j < n; j++) {
+            resident_ids_.insert(id_ptr[j]);
+        }
+    }
 
     for (int64_t i = 0; i < n; i++) {
         int64_t pid = partition_ids_for_each[i];
@@ -264,6 +277,7 @@ shared_ptr<ModifyTimingInfo> PartitionManager::add(
 shared_ptr<ModifyTimingInfo> PartitionManager::remove(const Tensor &ids) {
 
     shared_ptr<ModifyTimingInfo> timing_info = std::make_shared<ModifyTimingInfo>();
+    auto write_lock = acquire_write_lock();
     auto s1 = std::chrono::high_resolution_clock::now();
     if (debug_) {
         std::cout << "[PartitionManager] remove: Removing " << ids.size(0) << " ids." << std::endl;
@@ -320,6 +334,7 @@ shared_ptr<ModifyTimingInfo> PartitionManager::remove(const Tensor &ids) {
 }
 
 Tensor PartitionManager::get(const Tensor &ids) {
+    auto read_lock = acquire_read_lock();
     if (debug_) {
         std::cout << "[PartitionManager] get: Retrieving vectors for " << ids.size(0) << " ids." << std::endl;
     }
@@ -337,6 +352,7 @@ Tensor PartitionManager::get(const Tensor &ids) {
 }
 
 vector<float *> PartitionManager::get_vectors(vector<int64_t> ids) {
+    auto read_lock = acquire_read_lock();
     return partition_store_->get_vectors_by_id(ids);
 }
 
@@ -348,6 +364,7 @@ shared_ptr<Clustering> PartitionManager::select_partitions(const Tensor &select_
     Tensor centroids = parent_->get(select_ids);
     vector<Tensor> cluster_vectors;
     vector<Tensor> cluster_ids;
+    auto read_lock = acquire_read_lock();
     int d = (int) partition_store_->d_;
 
     auto selected_ids_accessor = select_ids.accessor<int64_t, 1>();
@@ -395,6 +412,7 @@ shared_ptr<Clustering> PartitionManager::split_partitions(const Tensor &partitio
         std::cout << "[PartitionManager] split_partitions: Splitting " << partition_ids.size(0)
                   << " partitions." << std::endl;
     }
+    auto write_lock = acquire_write_lock();
     int64_t num_partitions_to_split = partition_ids.size(0);
     int64_t num_splits = 2;
     int64_t total_new_partitions = num_partitions_to_split * num_splits;
@@ -449,6 +467,7 @@ void PartitionManager::refine_partitions(Tensor partition_ids, int iterations) {
         std::cout << "[PartitionManager] refine_partitions: Refining partitions with iterations = "
                   << iterations << std::endl;
     }
+    auto write_lock = acquire_write_lock();
 
     if (!partition_ids.defined()) {
         partition_ids = parent_->get_ids();
@@ -488,6 +507,7 @@ void PartitionManager::refine_partitions(Tensor partition_ids, int iterations) {
 }
 
 void PartitionManager::add_partitions(shared_ptr<Clustering> partitions) {
+    auto write_lock = acquire_write_lock();
     int64_t nlist = partitions->nlist();
     partitions->partition_ids = torch::arange(curr_partition_id_, curr_partition_id_ + nlist, torch::kInt64);
     curr_partition_id_ += nlist;
@@ -522,8 +542,13 @@ void PartitionManager::add_partitions(shared_ptr<Clustering> partitions) {
 }
 
 void PartitionManager::delete_partitions(const Tensor &partition_ids, bool reassign) {
-    if (parent_ != nullptr) {
-        shared_ptr<Clustering> partitions = select_partitions(partition_ids, true);
+    if (!parent_) {
+        throw runtime_error("Index is not partitioned");
+    }
+
+    shared_ptr<Clustering> partitions = select_partitions(partition_ids, true);
+    {
+        auto write_lock = acquire_write_lock();
         parent_->remove(partition_ids);
 
         auto partition_ids_accessor = partition_ids.accessor<int64_t, 1>();
@@ -534,22 +559,20 @@ void PartitionManager::delete_partitions(const Tensor &partition_ids, bool reass
                 std::cout << "[PartitionManager] delete_partitions: Removed partition " << list_no << std::endl;
             }
         }
+    }
 
-        if (reassign) {
-            if (debug_) {
-                std::cout << "[PartitionManager] delete_partitions: Reassigning vectors from deleted partitions." << std::endl;
-            }
-            for (int i = 0; i < partition_ids.size(0); i++) {
-                Tensor vectors = partitions->vectors[i];
-                Tensor ids = partitions->vector_ids[i];
-                if (vectors.size(0) == 0) {
-                    continue;
-                }
-                add(vectors, ids, Tensor(), false);
-            }
+    if (reassign) {
+        if (debug_) {
+            std::cout << "[PartitionManager] delete_partitions: Reassigning vectors from deleted partitions." << std::endl;
         }
-    } else {
-        throw runtime_error("Index is not partitioned");
+        for (int i = 0; i < partition_ids.size(0); i++) {
+            Tensor vectors = partitions->vectors[i];
+            Tensor ids = partitions->vector_ids[i];
+            if (vectors.size(0) == 0) {
+                continue;
+            }
+            add(vectors, ids, Tensor(), false);
+        }
     }
 }
 
@@ -561,6 +584,7 @@ void PartitionManager::distribute_partitions(int num_workers) {
     }
 
     if (parent_ == nullptr) {
+        auto read_lock = acquire_read_lock();
         auto codes = (float *) partition_store_->get_codes(0);
         auto ids = (int64_t *) partition_store_->get_ids(0);
         int64_t ntotal = partition_store_->list_size(0);
@@ -590,6 +614,7 @@ void PartitionManager::distribute_partitions(int num_workers) {
         new_partitions->vectors = new_vectors;
         new_partitions->vector_ids = new_ids;
 
+        read_lock.unlock();
         init_partitions(nullptr, new_partitions, false);
         if (debug_) {
             std::cout << "[PartitionManager] distribute_flat: Distribution complete." << std::endl;
@@ -603,14 +628,17 @@ void PartitionManager::distribute_partitions(int num_workers) {
 }
 
 void PartitionManager::set_partition_core_id(int64_t partition_id, int core_id) {
+    auto write_lock = acquire_write_lock();
     partition_store_->partitions_[partition_id]->core_id_ = core_id;
 }
 
 int PartitionManager::get_partition_core_id(int64_t partition_id) {
+    auto read_lock = acquire_read_lock();
     return partition_store_->partitions_[partition_id]->core_id_;
 }
 
 int64_t PartitionManager::ntotal() const {
+    auto read_lock = acquire_read_lock();
     if (!partition_store_) {
         return 0;
     }
@@ -618,6 +646,7 @@ int64_t PartitionManager::ntotal() const {
 }
 
 int64_t PartitionManager::nlist() const {
+    auto read_lock = acquire_read_lock();
     if (!partition_store_) {
         return 0;
     }
@@ -625,6 +654,7 @@ int64_t PartitionManager::nlist() const {
 }
 
 int PartitionManager::d() const {
+    auto read_lock = acquire_read_lock();
     if (!partition_store_) {
         return 0;
     }
@@ -635,11 +665,13 @@ Tensor PartitionManager::get_partition_ids() {
     if (debug_) {
         std::cout << "[PartitionManager] get_partition_ids: Retrieving partition ids." << std::endl;
     }
+    auto read_lock = acquire_read_lock();
     return partition_store_->get_partition_ids();
 }
 
 Tensor PartitionManager::get_ids() {
-    Tensor partition_ids = get_partition_ids();
+    auto read_lock = acquire_read_lock();
+    Tensor partition_ids = partition_store_->get_partition_ids();
     auto partition_ids_accessor = partition_ids.accessor<int64_t, 1>();
     vector<Tensor> ids;
 
@@ -654,6 +686,7 @@ Tensor PartitionManager::get_ids() {
 }
 
 vector<int64_t> PartitionManager::get_partition_sizes(vector<int64_t> partition_ids) {
+    auto read_lock = acquire_read_lock();
     vector<int64_t> partition_sizes;
     for (int64_t partition_id : partition_ids) {
         partition_sizes.push_back(partition_store_->list_size(partition_id));
@@ -665,11 +698,12 @@ Tensor PartitionManager::get_partition_sizes(Tensor partition_ids) {
     if (debug_) {
         std::cout << "[PartitionManager] get_partition_sizes: Getting sizes for partitions." << std::endl;
     }
+    auto read_lock = acquire_read_lock();
     if (!partition_store_) {
         throw runtime_error("[PartitionManager] get_partition_sizes: partition_store_ is null.");
     }
     if (!partition_ids.defined() || partition_ids.size(0) == 0) {
-        partition_ids = get_partition_ids();
+        partition_ids = partition_store_->get_partition_ids();
     }
 
     Tensor partition_sizes = torch::empty({partition_ids.size(0)}, torch::kInt64);
@@ -687,6 +721,7 @@ Tensor PartitionManager::get_partition_sizes(Tensor partition_ids) {
 }
 
 int64_t PartitionManager::get_partition_size(int64_t partition_id) {
+    auto read_lock = acquire_read_lock();
     return partition_store_->list_size(partition_id);
 }
 
@@ -695,6 +730,7 @@ bool PartitionManager::validate() {
     if (debug_) {
         std::cout << "[PartitionManager] validate: Validating partitions." << std::endl;
     }
+    auto read_lock = acquire_read_lock();
     if (!partition_store_) {
         throw runtime_error("[PartitionManager] validate: partition_store_ is null.");
     }
@@ -706,6 +742,7 @@ void PartitionManager::save(const string &path) {
     if (debug_) {
         std::cout << "[PartitionManagerPartitionManager] save: Saving partitions to " << path << std::endl;
     }
+    auto read_lock = acquire_read_lock();
     if (!partition_store_) {
         throw runtime_error("No partitions to save");
     }
@@ -719,6 +756,7 @@ void PartitionManager::load(const string &path) {
     if (debug_) {
         std::cout << "[PartitionManager] load: Loading partitions from " << path << std::endl;
     }
+    auto write_lock = acquire_write_lock();
     if (!partition_store_) {
         partition_store_ = std::make_shared<faiss::DynamicInvertedLists>(0, 0);
     }

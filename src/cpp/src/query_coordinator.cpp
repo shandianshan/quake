@@ -131,107 +131,96 @@ void QueryCoordinator::partition_scan_worker_fn(int core_index) {
 
         worker_job_counter_[core_index]++;
 
-        // Retrieve partition data.
-        const float *partition_codes = (float *) partition_manager_->partition_store_->get_codes(job.partition_id);
-        const int64_t *partition_ids = (int64_t *) partition_manager_->partition_store_->get_ids(job.partition_id);
-        int64_t partition_size = partition_manager_->partition_store_->list_size(job.partition_id);
+        int64_t partition_dim = partition_manager_->d();
+        {
+            auto partition_lock = partition_manager_->acquire_read_lock();
+            const float *partition_codes = (float *) partition_manager_->partition_store_->get_codes(job.partition_id);
+            const int64_t *partition_ids = (int64_t *) partition_manager_->partition_store_->get_ids(job.partition_id);
+            int64_t partition_size = partition_manager_->partition_store_->list_size(job.partition_id);
 
-        // Branch for non-batched jobs.
-        if (!job.is_batched) {
-
-            // Allocate a thread-local query buffer if needed.
-            if (res.local_query_buffer.size() < partition_manager_->d() * sizeof(float)) {
-                res.local_query_buffer.resize(partition_manager_->d() * sizeof(float));
-            }
-
-            // Copy the contents of the query vector to the local buffer using memcpy.
-            if (memcpy(res.local_query_buffer.data(), job.query_vector, partition_manager_->d() * sizeof(float)) == nullptr) {
-                throw std::runtime_error("[partition_scan_worker_fn] memcpy failed.");
-            }
-
-            if (local_topk_buffer == nullptr) {
-                throw std::runtime_error("[partition_scan_worker_fn] local_topk_buffer is null.");
-            } else {
-                local_topk_buffer->set_k(job.k);
-                local_topk_buffer->reset();
-            }
-            // Perform the scan on the partition.
-            scan_list((float *) res.local_query_buffer.data(),
-                partition_codes,
-                partition_ids,
-                      partition_size,
-                      partition_manager_->d(),
-                      *local_topk_buffer,
-                      metric_);
-
-            vector<float> topk = local_topk_buffer->get_topk();
-            vector<int64_t> topk_indices = local_topk_buffer->get_topk_indices();
-            int64_t n_results = topk_indices.size();
-
-            // Merge local results into the global query buffer.
-            global_topk_buffer_pool_[job.query_ids[0]]->batch_add(topk.data(), topk_indices.data(), n_results);
-            job_flags_[job.query_ids[0]][job.rank] = true;
-        }
-        // Batched job branch.
-        else {
-            if (!job.query_vector || job.num_queries == 0) {
-                throw std::runtime_error("[partition_scan_worker_fn] Invalid batched job.");
-            }
-
-            // Allocate a thread-local query buffer if needed.
-            if (res.local_query_buffer.size() < partition_manager_->d() * sizeof(float) * job.num_queries) {
-                res.local_query_buffer.resize(partition_manager_->d() * sizeof(float) * job.num_queries);
-            }
-
-            int64_t d = partition_manager_->d();
-            std::vector<float> query_subset(job.num_queries * d);
-            for (int i = 0; i < job.num_queries; i++) {
-                int64_t global_q = job.query_ids[i];
-                memcpy(&query_subset[i * d],
-                       job.query_vector + global_q * d,
-                       d * sizeof(float));
-            }
-            // Then copy query_subset into your local buffer if needed:
-            if(memcpy(res.local_query_buffer.data(),
-                   query_subset.data(),
-                   query_subset.size() * sizeof(float)) == nullptr) {
-                throw std::runtime_error("[partition_scan_worker_fn] memcpy failed.");
-            }
-
-            // Use a thread_local vector to hold one buffer per query.
-            if (res.topk_buffer_pool.size() < static_cast<size_t>(job.num_queries)) {
-                res.topk_buffer_pool.resize(job.num_queries);
-                for (int64_t q = 0; q < job.num_queries; ++q) {
-                    res.topk_buffer_pool[q] = std::make_shared<TopkBuffer>(job.k, metric_ == faiss::METRIC_INNER_PRODUCT);
+            if (!job.is_batched) {
+                if (res.local_query_buffer.size() < partition_dim * sizeof(float)) {
+                    res.local_query_buffer.resize(partition_dim * sizeof(float));
                 }
-            } else {
-                for (int64_t q = 0; q < job.num_queries; ++q) {
-                    res.topk_buffer_pool[q]->set_k(job.k);
-                    res.topk_buffer_pool[q]->reset();
+
+                if (memcpy(res.local_query_buffer.data(), job.query_vector, partition_dim * sizeof(float)) == nullptr) {
+                    throw std::runtime_error("[partition_scan_worker_fn] memcpy failed.");
                 }
-            }
 
-            // Process the batched job.
-            batched_scan_list((float *) res.local_query_buffer.data(),
-                partition_codes,
-                partition_ids,
-                              job.num_queries,
-                              partition_size,
-                              partition_manager_->d(),
-                              res.topk_buffer_pool,
-                              metric_);
+                if (local_topk_buffer == nullptr) {
+                    throw std::runtime_error("[partition_scan_worker_fn] local_topk_buffer is null.");
+                } else {
+                    local_topk_buffer->set_k(job.k);
+                    local_topk_buffer->reset();
+                }
 
-            vector<vector<float>> topk_list(job.num_queries);
-            vector<vector<int64_t>> topk_indices_list(job.num_queries);
-            for (int64_t q = 0; q < job.num_queries; q++) {
-                topk_list[q] = res.topk_buffer_pool[q]->get_topk();
-                topk_indices_list[q] = res.topk_buffer_pool[q]->get_topk_indices();
-            }
+                scan_list((float *) res.local_query_buffer.data(),
+                          partition_codes,
+                          partition_ids,
+                          partition_size,
+                          partition_dim,
+                          *local_topk_buffer,
+                          metric_);
 
-            for (int64_t q = 0; q < job.num_queries; q++) {
-                int64_t global_q = job.query_ids[q];
-                int n_results = topk_indices_list[q].size();
-                global_topk_buffer_pool_[global_q]->batch_add(topk_list[q].data(), topk_indices_list[q].data(), n_results);
+                vector<float> topk = local_topk_buffer->get_topk();
+                vector<int64_t> topk_indices = local_topk_buffer->get_topk_indices();
+                int64_t n_results = topk_indices.size();
+                global_topk_buffer_pool_[job.query_ids[0]]->batch_add(topk.data(), topk_indices.data(), n_results);
+                job_flags_[job.query_ids[0]][job.rank] = true;
+            } else {
+                if (!job.query_vector || job.num_queries == 0) {
+                    throw std::runtime_error("[partition_scan_worker_fn] Invalid batched job.");
+                }
+                if (res.local_query_buffer.size() < partition_dim * sizeof(float) * job.num_queries) {
+                    res.local_query_buffer.resize(partition_dim * sizeof(float) * job.num_queries);
+                }
+
+                std::vector<float> query_subset(job.num_queries * partition_dim);
+                for (int i = 0; i < job.num_queries; i++) {
+                    int64_t global_q = job.query_ids[i];
+                    memcpy(&query_subset[i * partition_dim],
+                           job.query_vector + global_q * partition_dim,
+                           partition_dim * sizeof(float));
+                }
+                if (memcpy(res.local_query_buffer.data(),
+                           query_subset.data(),
+                           query_subset.size() * sizeof(float)) == nullptr) {
+                    throw std::runtime_error("[partition_scan_worker_fn] memcpy failed.");
+                }
+
+                if (res.topk_buffer_pool.size() < static_cast<size_t>(job.num_queries)) {
+                    res.topk_buffer_pool.resize(job.num_queries);
+                    for (int64_t q = 0; q < job.num_queries; ++q) {
+                        res.topk_buffer_pool[q] = std::make_shared<TopkBuffer>(job.k, metric_ == faiss::METRIC_INNER_PRODUCT);
+                    }
+                } else {
+                    for (int64_t q = 0; q < job.num_queries; ++q) {
+                        res.topk_buffer_pool[q]->set_k(job.k);
+                        res.topk_buffer_pool[q]->reset();
+                    }
+                }
+
+                batched_scan_list((float *) res.local_query_buffer.data(),
+                                  partition_codes,
+                                  partition_ids,
+                                  job.num_queries,
+                                  partition_size,
+                                  partition_dim,
+                                  res.topk_buffer_pool,
+                                  metric_);
+
+                vector<vector<float>> topk_list(job.num_queries);
+                vector<vector<int64_t>> topk_indices_list(job.num_queries);
+                for (int64_t q = 0; q < job.num_queries; q++) {
+                    topk_list[q] = res.topk_buffer_pool[q]->get_topk();
+                    topk_indices_list[q] = res.topk_buffer_pool[q]->get_topk_indices();
+                }
+
+                for (int64_t q = 0; q < job.num_queries; q++) {
+                    int64_t global_q = job.query_ids[q];
+                    int n_results = topk_indices_list[q].size();
+                    global_topk_buffer_pool_[global_q]->batch_add(topk_list[q].data(), topk_indices_list[q].data(), n_results);
+                }
             }
         }
         auto job_process_end = std::chrono::high_resolution_clock::now();
@@ -542,17 +531,20 @@ shared_ptr<SearchResult> QueryCoordinator::serial_scan(Tensor x, Tensor partitio
             }
 
             start_time = high_resolution_clock::now();
-            float *list_vectors = (float *) partition_manager_->partition_store_->get_codes(pi);
-            int64_t *list_ids = (int64_t *) partition_manager_->partition_store_->get_ids(pi);
-            int64_t list_size = partition_manager_->partition_store_->list_size(pi);
+            {
+                auto partition_lock = partition_manager_->acquire_read_lock();
+                float *list_vectors = (float *) partition_manager_->partition_store_->get_codes(pi);
+                int64_t *list_ids = (int64_t *) partition_manager_->partition_store_->get_ids(pi);
+                int64_t list_size = partition_manager_->partition_store_->list_size(pi);
 
-            scan_list(query_vec,
-                      list_vectors,
-                      list_ids,
-                      partition_manager_->partition_store_->list_size(pi),
-                      dimension,
-                      *topk_buf,
-                      metric_);
+                scan_list(query_vec,
+                          list_vectors,
+                          list_ids,
+                          list_size,
+                          dimension,
+                          *topk_buf,
+                          metric_);
+            }
 
             float curr_radius = topk_buf->get_kth_distance();
             float percent_change = abs(curr_radius - query_radius) / curr_radius;
@@ -730,23 +722,23 @@ shared_ptr<SearchResult> QueryCoordinator::batched_serial_scan(
         int64_t batch_size = x_subset.size(0);
 
         // Get the partition’s data.
-        const float *list_codes = (float *) partition_manager_->partition_store_->get_codes(pid);
-        const int64_t *list_ids = partition_manager_->partition_store_->get_ids(pid);
-        int64_t list_size = partition_manager_->partition_store_->list_size(pid);
         int64_t d = partition_manager_->d();
-
-        // Create temporary Top-K buffers for this sub-batch.
         vector<shared_ptr<TopkBuffer>> local_buffers = create_buffers(batch_size, k, (metric_ == faiss::METRIC_INNER_PRODUCT));
+        {
+            auto partition_lock = partition_manager_->acquire_read_lock();
+            const float *list_codes = (float *) partition_manager_->partition_store_->get_codes(pid);
+            const int64_t *list_ids = partition_manager_->partition_store_->get_ids(pid);
+            int64_t list_size = partition_manager_->partition_store_->list_size(pid);
 
-        // Perform a single batched scan on the partition.
-        batched_scan_list(x_subset.data_ptr<float>(),
-                          list_codes,
-                          list_ids,
-                          batch_size,
-                          list_size,
-                          d,
-                          local_buffers,
-                          metric_);
+            batched_scan_list(x_subset.data_ptr<float>(),
+                              list_codes,
+                              list_ids,
+                              batch_size,
+                              list_size,
+                              d,
+                              local_buffers,
+                              metric_);
+        }
 
         // Merge the local results into the corresponding global buffers.
         for (int i = 0; i < batch_size; i++) {
