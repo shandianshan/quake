@@ -654,7 +654,6 @@ void PartitionManager::distribute_partitions(int num_workers) {
         new_partitions->vectors = new_vectors;
         new_partitions->vector_ids = new_ids;
 
-        read_lock.unlock();
         init_partitions(nullptr, new_partitions, false);
         if (debug_) {
             std::cout << "[PartitionManager] distribute_flat: Distribution complete." << std::endl;
