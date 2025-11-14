@@ -38,6 +38,31 @@ std::unique_lock<std::shared_mutex> PartitionManager::acquire_write_lock() const
     return std::unique_lock<std::shared_mutex>(partition_mutex_);
 }
 
+std::shared_ptr<std::shared_mutex> PartitionManager::get_partition_mutex(int64_t partition_id) const {
+    {
+        std::shared_lock<std::shared_mutex> lock(partition_lock_map_mutex_);
+        auto it = partition_locks_.find(partition_id);
+        if (it != partition_locks_.end()) {
+            return it->second;
+        }
+    }
+    auto new_mutex = std::make_shared<std::shared_mutex>();
+    {
+        std::unique_lock<std::shared_mutex> lock(partition_lock_map_mutex_);
+        auto it = partition_locks_.find(partition_id);
+        if (it == partition_locks_.end()) {
+            partition_locks_[partition_id] = new_mutex;
+            return new_mutex;
+        }
+        return it->second;
+    }
+}
+
+void PartitionManager::remove_partition_mutex(int64_t partition_id) {
+    std::unique_lock<std::shared_mutex> lock(partition_lock_map_mutex_);
+    partition_locks_.erase(partition_id);
+}
+
 void PartitionManager::init_partitions(
     shared_ptr<QuakeIndex> parent,
     shared_ptr<Clustering> clustering,
@@ -77,6 +102,7 @@ void PartitionManager::init_partitions(
     auto partition_ids_accessor = clustering->partition_ids.accessor<int64_t, 1>();
     for (int64_t i = 0; i < nlist; i++) {
         partition_store_->add_list(partition_ids_accessor[i]);
+        get_partition_mutex(partition_ids_accessor[i]);
         if (debug_) {
             std::cout << "[PartitionManager] init_partitions: Added empty list for partition " << i << std::endl;
         }
@@ -100,6 +126,7 @@ void PartitionManager::init_partitions(
             if (check_uniques_ && check_uniques) {
                 // for each id insert into resident_ids_, if the id already exists, throw an error
                 auto id_ptr = id.data_ptr<int64_t>();
+                std::lock_guard<std::mutex> resident_guard(resident_mutex_);
                 for (int64_t j = 0; j < count; j++) {
                     int64_t id_val = id_ptr[j];
                     if (resident_ids_.find(id_val) != resident_ids_.end()) {
@@ -223,10 +250,10 @@ shared_ptr<ModifyTimingInfo> PartitionManager::add(
     timing_info->find_partition_time_us = std::chrono::duration_cast<std::chrono::microseconds>(e2 - s2).count();
 
     //////////////////////////////////////////
-    /// Add vectors to partitions (exclusive section)
+    /// Add vectors to partitions (per-partition locking)
     //////////////////////////////////////////
     auto s3 = std::chrono::high_resolution_clock::now();
-    auto write_lock = acquire_write_lock();
+    auto read_lock = acquire_read_lock();
     if (!partition_store_) {
         throw runtime_error("[PartitionManager] add: partition_store_ is null. Did you call init_partitions?");
     }
@@ -238,12 +265,19 @@ shared_ptr<ModifyTimingInfo> PartitionManager::add(
         }
     }
 
+    std::unordered_map<int64_t, std::vector<int64_t>> partition_to_indices;
+    partition_to_indices.reserve(n);
+    for (int64_t i = 0; i < n; i++) {
+        partition_to_indices[partition_ids_for_each[i]].push_back(i);
+    }
+
     auto id_ptr = vector_ids.data_ptr<int64_t>();
     auto id_accessor = vector_ids.accessor<int64_t, 1>();
     const uint8_t *code_ptr = as_uint8_ptr(vectors);
     size_t code_size_bytes = partition_store_->code_size;
 
     if (check_uniques_ && check_uniques) {
+        std::lock_guard<std::mutex> resident_guard(resident_mutex_);
         for (int64_t j = 0; j < n; j++) {
             int64_t id_val = id_ptr[j];
             if (resident_ids_.find(id_val) != resident_ids_.end()) {
@@ -255,19 +289,22 @@ shared_ptr<ModifyTimingInfo> PartitionManager::add(
         }
     }
 
-    for (int64_t i = 0; i < n; i++) {
-        int64_t pid = partition_ids_for_each[i];
-        if (debug_) {
-            std::cout << "[PartitionManager] add: Inserting vector " << i << " with id " << id_accessor[i]
-                      << " into partition " << pid << std::endl;
+    for (auto &entry : partition_to_indices) {
+        int64_t pid = entry.first;
+        auto partition_mutex = get_partition_mutex(pid);
+        std::unique_lock<std::shared_mutex> partition_lock(*partition_mutex);
+        for (int64_t idx : entry.second) {
+            if (debug_) {
+                std::cout << "[PartitionManager] add: Inserting vector " << idx << " with id " << id_accessor[idx]
+                          << " into partition " << pid << std::endl;
+            }
+            partition_store_->add_entries(
+                pid,
+                /*n_entry=*/1,
+                id_ptr + idx,
+                code_ptr + idx * code_size_bytes
+            );
         }
-
-        partition_store_->add_entries(
-            pid,
-            /*n_entry=*/1,
-            id_ptr + i,
-            code_ptr + i * code_size_bytes
-        );
     }
     auto e3 = std::chrono::high_resolution_clock::now();
     timing_info->modify_time_us = std::chrono::duration_cast<std::chrono::microseconds>(e3 - s3).count();
@@ -295,6 +332,7 @@ shared_ptr<ModifyTimingInfo> PartitionManager::remove(const Tensor &ids) {
     if (check_uniques_) {
         // ids must be in resident_ids_
         auto id_ptr = ids.data_ptr<int64_t>();
+        std::lock_guard<std::mutex> resident_guard(resident_mutex_);
         for (int64_t i = 0; i < ids.size(0); i++) {
             int64_t id_val = id_ptr[i];
             if (resident_ids_.find(id_val) == resident_ids_.end()) {
@@ -523,6 +561,7 @@ void PartitionManager::add_partitions(shared_ptr<Clustering> partitions) {
     for (int64_t i = 0; i < nlist; i++) {
         int64_t list_no = p_ids_accessor[i];
         partition_store_->add_list(list_no);
+        get_partition_mutex(list_no);
         partition_store_->add_entries(
             list_no,
             partitions->vectors[i].size(0),
@@ -555,6 +594,7 @@ void PartitionManager::delete_partitions(const Tensor &partition_ids, bool reass
         for (int i = 0; i < partition_ids.size(0); i++) {
             int64_t list_no = partition_ids_accessor[i];
             partition_store_->remove_list(list_no);
+            remove_partition_mutex(list_no);
             if (debug_) {
                 std::cout << "[PartitionManager] delete_partitions: Removed partition " << list_no << std::endl;
             }
@@ -588,8 +628,9 @@ void PartitionManager::distribute_partitions(int num_workers) {
         auto codes = (float *) partition_store_->get_codes(0);
         auto ids = (int64_t *) partition_store_->get_ids(0);
         int64_t ntotal = partition_store_->list_size(0);
-        Tensor vectors = torch::from_blob(codes, {ntotal, d()}, torch::kFloat32);
-        Tensor vector_ids = torch::from_blob(ids, {ntotal}, torch::kInt64);
+        Tensor vectors = torch::from_blob(codes, {ntotal, d()}, torch::kFloat32).clone();
+        Tensor vector_ids = torch::from_blob(ids, {ntotal}, torch::kInt64).clone();
+        read_lock.unlock();
 
         Tensor partition_assignments = torch::randint(num_workers, {vectors.size(0)}, torch::kInt64);
         Tensor partition_ids = torch::arange(num_workers, torch::kInt64);
@@ -607,7 +648,6 @@ void PartitionManager::distribute_partitions(int num_workers) {
                           << " assigned " << new_vectors[i].size(0) << " vectors." << std::endl;
             }
         }
-
         shared_ptr<Clustering> new_partitions = std::make_shared<Clustering>();
         new_partitions->centroids = centroids;
         new_partitions->partition_ids = partition_ids;
@@ -628,12 +668,14 @@ void PartitionManager::distribute_partitions(int num_workers) {
 }
 
 void PartitionManager::set_partition_core_id(int64_t partition_id, int core_id) {
-    auto write_lock = acquire_write_lock();
+    auto partition_mutex = get_partition_mutex(partition_id);
+    std::unique_lock<std::shared_mutex> partition_lock(*partition_mutex);
     partition_store_->partitions_[partition_id]->core_id_ = core_id;
 }
 
 int PartitionManager::get_partition_core_id(int64_t partition_id) {
-    auto read_lock = acquire_read_lock();
+    auto partition_mutex = get_partition_mutex(partition_id);
+    std::shared_lock<std::shared_mutex> partition_lock(*partition_mutex);
     return partition_store_->partitions_[partition_id]->core_id_;
 }
 
@@ -762,11 +804,13 @@ void PartitionManager::load(const string &path) {
     }
     partition_store_->load(path);
     curr_partition_id_ = partition_store_->nlist;
+    write_lock.unlock();
 
     if (check_uniques_) {
         // add ids into resident set
         Tensor ids = get_ids();
         auto ids_a = ids.accessor<int64_t, 1>();
+        std::lock_guard<std::mutex> resident_guard(resident_mutex_);
         for (int i = 0; i < ids.size(0); i++) {
             resident_ids_.insert(ids_a[i]);
         }
@@ -774,5 +818,15 @@ void PartitionManager::load(const string &path) {
 
     if (debug_) {
         std::cout << "[PartitionManager] load: Load complete." << std::endl;
+    }
+
+    {
+        std::unique_lock<std::shared_mutex> lock(partition_lock_map_mutex_);
+        partition_locks_.clear();
+        Tensor partition_ids = partition_store_->get_partition_ids();
+        auto accessor = partition_ids.accessor<int64_t, 1>();
+        for (int64_t i = 0; i < partition_ids.size(0); i++) {
+            partition_locks_[accessor[i]] = std::make_shared<std::shared_mutex>();
+        }
     }
 }

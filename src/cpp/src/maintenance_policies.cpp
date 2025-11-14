@@ -81,7 +81,8 @@ shared_ptr<MaintenanceTimingInfo> MaintenancePolicy::perform_maintenance() {
                 search_params->batched_scan = true;
                 Tensor part_vecs;
                 {
-                    auto partition_lock = partition_manager_->acquire_read_lock();
+                    auto partition_mutex_handle = partition_manager_->get_partition_mutex(partition_id);
+                    std::shared_lock<std::shared_mutex> partition_lock(*partition_mutex_handle);
                     float *partition_vectors = (float *) partition_manager_->partition_store_->partitions_[partition_id]->codes_;
                     part_vecs = torch::from_blob(partition_vectors,
                                                  {(int64_t) partition_manager_->partition_store_->list_size(partition_id),

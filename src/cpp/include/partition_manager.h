@@ -10,6 +10,8 @@
 #include <common.h>
 #include <dynamic_inverted_list.h>
 #include <shared_mutex>
+#include <unordered_map>
+#include <mutex>
 
 class QuakeIndex;
 
@@ -32,7 +34,10 @@ public:
     bool check_uniques_ = false; ///< If true, check that vector IDs are unique and don't already exist in the index.
 
     std::set<int64_t> resident_ids_; ///< Set of partition IDs.
-    mutable std::shared_mutex partition_mutex_; ///< Guards access to partition metadata and storage.
+    mutable std::mutex resident_mutex_; ///< Guards resident_ids_.
+    mutable std::shared_mutex partition_mutex_; ///< Guards global partition metadata.
+    mutable std::shared_mutex partition_lock_map_mutex_; ///< Guards the per-partition lock map.
+    mutable std::unordered_map<int64_t, std::shared_ptr<std::shared_mutex>> partition_locks_; ///< Per-partition locks.
 
     /**
      * @brief Constructor for PartitionManager.
@@ -190,14 +195,24 @@ public:
     void load(const string &path);
 
     /**
-     * @brief Acquire a shared (read) lock on the partitions.
+     * @brief Acquire a shared (read) lock on the global partition manager state.
      */
     std::shared_lock<std::shared_mutex> acquire_read_lock() const;
 
     /**
-     * @brief Acquire an exclusive (write) lock on the partitions.
+     * @brief Acquire an exclusive (write) lock on the global partition manager state.
      */
     std::unique_lock<std::shared_mutex> acquire_write_lock() const;
+
+    /**
+     * @brief Retrieve (and lazily create) the mutex for a given partition.
+     */
+    std::shared_ptr<std::shared_mutex> get_partition_mutex(int64_t partition_id) const;
+
+    /**
+     * @brief Remove the mutex associated with a partition (used after deletion).
+     */
+    void remove_partition_mutex(int64_t partition_id);
 };
 
 
