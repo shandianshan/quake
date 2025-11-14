@@ -132,9 +132,11 @@ void QueryCoordinator::partition_scan_worker_fn(int core_index) {
         worker_job_counter_[core_index]++;
 
         int64_t partition_dim = partition_manager_->d();
+        auto structure_lock = partition_manager_->acquire_read_lock();
         auto partition_mutex_handle = partition_manager_->get_partition_mutex(job.partition_id);
         {
             std::shared_lock<std::shared_mutex> partition_lock(*partition_mutex_handle);
+            structure_lock.unlock();
             const float *partition_codes = (float *) partition_manager_->partition_store_->get_codes(job.partition_id);
             const int64_t *partition_ids = (int64_t *) partition_manager_->partition_store_->get_ids(job.partition_id);
             int64_t partition_size = partition_manager_->partition_store_->list_size(job.partition_id);
@@ -533,8 +535,10 @@ shared_ptr<SearchResult> QueryCoordinator::serial_scan(Tensor x, Tensor partitio
 
             start_time = high_resolution_clock::now();
             {
+                auto structure_lock = partition_manager_->acquire_read_lock();
                 auto partition_mutex_handle = partition_manager_->get_partition_mutex(pi);
                 std::shared_lock<std::shared_mutex> partition_lock(*partition_mutex_handle);
+                structure_lock.unlock();
                 float *list_vectors = (float *) partition_manager_->partition_store_->get_codes(pi);
                 int64_t *list_ids = (int64_t *) partition_manager_->partition_store_->get_ids(pi);
                 int64_t list_size = partition_manager_->partition_store_->list_size(pi);
@@ -727,8 +731,10 @@ shared_ptr<SearchResult> QueryCoordinator::batched_serial_scan(
         int64_t d = partition_manager_->d();
         vector<shared_ptr<TopkBuffer>> local_buffers = create_buffers(batch_size, k, (metric_ == faiss::METRIC_INNER_PRODUCT));
         {
+            auto structure_lock = partition_manager_->acquire_read_lock();
             auto partition_mutex_handle = partition_manager_->get_partition_mutex(pid);
             std::shared_lock<std::shared_mutex> partition_lock(*partition_mutex_handle);
+            structure_lock.unlock();
             const float *list_codes = (float *) partition_manager_->partition_store_->get_codes(pid);
             const int64_t *list_ids = partition_manager_->partition_store_->get_ids(pid);
             int64_t list_size = partition_manager_->partition_store_->list_size(pid);
